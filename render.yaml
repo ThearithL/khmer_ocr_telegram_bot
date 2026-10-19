@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: khmer-ocr-telegram-bot
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: PUBLIC_URL
+        sync: false
+      - key: DEV_MODE
+        value: "0"
