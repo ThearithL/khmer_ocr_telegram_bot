@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <meta name="theme-color" content="#101827" />
+  <title>Khmer OCR</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="app">
+    <header class="hero"><div class="logo">ក</div><div><h1>Khmer OCR</h1><p>រូបភាព → អត្ថបទខ្មែរ • Image → Khmer text</p></div></header>
+    <section class="card upload-card">
+      <label class="dropzone" for="imageInput"><span class="camera">📷</span><strong>ជ្រើសរើសរូបភាព</strong><small>Choose JPG, PNG or WEBP</small></label>
+      <input id="imageInput" type="file" accept="image/jpeg,image/png,image/webp" hidden />
+      <img id="preview" class="preview hidden" alt="Preview" />
+      <p id="sourceHint" class="source-hint hidden">📥 Loaded from Telegram</p>
+    </section>
+    <section class="card controls">
+      <label for="language">OCR language</label>
+      <select id="language"><option value="khm+eng">🇰🇭 Khmer + English</option><option value="khm">🇰🇭 Khmer only</option><option value="eng">🇬🇧 English only</option></select>
+      <button id="scanBtn" class="primary" disabled>✨ Scan Text</button>
+      <div class="progress-wrap hidden" id="progressWrap"><div class="progress-track"><div class="progress-bar" id="progressBar"></div></div><small id="progressText">Preparing OCR…</small></div>
+    </section>
+    <section class="card result-card">
+      <div class="result-head"><h2>OCR Result</h2><span id="status">Ready</span></div>
+      <textarea id="result" placeholder="អត្ថបទដែលស្គេនបាននឹងបង្ហាញនៅទីនេះ...\nRecognized text will appear here."></textarea>
+      <div class="actions"><button id="copyBtn">📋 Copy</button><button id="sendBtn">📤 Send to Bot</button><button id="clearBtn">🗑 Clear</button></div>
+    </section>
+    <p class="tip">💡 រូបភាពត្រង់ ច្បាស់ និងមានពន្លឺល្អ នឹងអានអក្សរខ្មែរបានល្អជាង។</p>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
