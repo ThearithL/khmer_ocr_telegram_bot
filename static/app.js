@@ -11,13 +11,19 @@ const scanBtn = document.getElementById('scanBtn');
 const result = document.getElementById('result');
 const status = document.getElementById('status');
 const language = document.getElementById('language');
+const aiFixBtn = document.getElementById('aiFixBtn');
 const copyBtn = document.getElementById('copyBtn');
+const saveBtn = document.getElementById('saveBtn');
 const sendBtn = document.getElementById('sendBtn');
 const clearBtn = document.getElementById('clearBtn');
 const progressWrap = document.getElementById('progressWrap');
 const progressBar = document.getElementById('progressBar');
 const progressText = document.getElementById('progressText');
 const sourceHint = document.getElementById('sourceHint');
+const storageHint = document.getElementById('storageHint');
+
+const HISTORY_KEY = 'khmer_ocr_history_v1';
+const HISTORY_LIMIT = 20;
 
 let selectedBlob = null;
 let previewUrl = null;
@@ -28,6 +34,25 @@ function updateProgress(value, text) {
   const pct = Math.max(0, Math.min(100, Math.round((value || 0) * 100)));
   progressBar.style.width = `${pct}%`;
   progressText.textContent = text || `OCR ${pct}%`;
+}
+
+function saveHistory(text, type = 'ocr') {
+  const clean = (text || '').trim();
+  if (!clean) return;
+  try {
+    const history = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+    history.unshift({
+      id: Date.now(),
+      type,
+      language: language.value,
+      text: clean,
+      createdAt: new Date().toISOString()
+    });
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, HISTORY_LIMIT)));
+    if (storageHint) storageHint.textContent = `Saved locally • ${Math.min(history.length, HISTORY_LIMIT)}/${HISTORY_LIMIT} recent results`;
+  } catch (_) {
+    if (storageHint) storageHint.textContent = 'Could not save local history on this device.';
+  }
 }
 
 function showBlob(blob, fromTelegram = false) {
@@ -133,7 +158,6 @@ function detectDocumentCrop(ctx, width, height) {
   const sw = Math.max(1, Math.round((right - left + 1) / sampleW * width));
   const sh = Math.max(1, Math.round((bottom - top + 1) / sampleH * height));
 
-  // Reject over-aggressive crops; keep most of the image for safety.
   if (sw < width * 0.55 || sh < height * 0.55) {
     return { sx: 0, sy: 0, sw: width, sh: height };
   }
@@ -174,7 +198,6 @@ async function buildOcrVariants(blob) {
   updateProgress(0.07, 'Improving Khmer text…');
   const raw = bctx.getImageData(0, 0, width, height);
 
-  // Variant 1: grayscale + local-friendly contrast boost.
   const grayCanvas = document.createElement('canvas');
   grayCanvas.width = width;
   grayCanvas.height = height;
@@ -193,7 +216,6 @@ async function buildOcrVariants(blob) {
   }
   gctx.putImageData(grayImg, 0, 0);
 
-  // Variant 2: adaptive threshold. This helps uneven lighting/shadows on phone photos.
   const binCanvas = document.createElement('canvas');
   binCanvas.width = width;
   binCanvas.height = height;
@@ -283,7 +305,6 @@ function cleanupOcrText(text, lang) {
       const meaningful = line.replace(/[\s|+._'"`~\-–—,:;!?()\[\]{}\/\\0-9]/g, '');
       if (remainingKhmer === 0 && meaningful.length <= 4) continue;
 
-      // Remove tiny isolated edge-noise tokens after a very large whitespace gap.
       line = line.replace(/\s{3,}[\u1780-\u17FF]{1,2}\s*$/g, '').trim();
     }
 
@@ -307,6 +328,7 @@ async function recognizePass(worker, blob, psm, label, start, span) {
 scanBtn.addEventListener('click', async () => {
   if (!selectedBlob || !window.Tesseract) return;
   scanBtn.disabled = true;
+  aiFixBtn.disabled = true;
   scanBtn.textContent = '⏳ Scanning…';
   progressWrap.classList.remove('hidden');
   updateProgress(0, 'Preparing free OCR…');
@@ -349,6 +371,7 @@ scanBtn.addEventListener('click', async () => {
     }
 
     result.value = best;
+    saveHistory(best, 'ocr');
     setStatus(best ? 'Done ✅ • Free OCR' : 'No text found');
     updateProgress(1, 'Done ✅');
     haptic('medium');
@@ -358,7 +381,46 @@ scanBtn.addEventListener('click', async () => {
   } finally {
     try { await worker?.terminate(); } catch (_) {}
     scanBtn.disabled = false;
+    aiFixBtn.disabled = false;
     scanBtn.textContent = '✨ Scan Text';
+  }
+});
+
+aiFixBtn.addEventListener('click', async () => {
+  const text = result.value.trim();
+  if (!text) {
+    setStatus('Scan text first');
+    return;
+  }
+
+  aiFixBtn.disabled = true;
+  aiFixBtn.textContent = '⏳ AI Fixing…';
+  progressWrap.classList.remove('hidden');
+  updateProgress(0.2, 'AI checking OCR errors…');
+  setStatus('AI Fix OCR…');
+
+  try {
+    const response = await fetch('/api/ai-fix', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, language: language.value })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || 'AI Fix failed');
+
+    const corrected = (data.text || '').trim();
+    if (!corrected) throw new Error('AI returned empty text');
+    result.value = corrected;
+    saveHistory(corrected, 'ai-fix');
+    updateProgress(1, 'AI Fix complete ✅');
+    setStatus('AI Fix done ✅');
+    haptic('medium');
+  } catch (err) {
+    setStatus('AI Fix unavailable');
+    alert(`AI Fix: ${err.message}`);
+  } finally {
+    aiFixBtn.disabled = false;
+    aiFixBtn.textContent = '✨ AI Fix OCR';
   }
 });
 
@@ -370,16 +432,67 @@ copyBtn.addEventListener('click', async () => {
   haptic();
 });
 
-sendBtn.addEventListener('click', () => {
+saveBtn.addEventListener('click', () => {
   const text = result.value.trim();
-  if (!text) return;
-  if (!tg?.sendData) {
-    setStatus('Open from Telegram to send');
+  if (!text) {
+    setStatus('No text to save');
     return;
   }
-  tg.sendData(JSON.stringify({ type: 'ocr_result', text: text.slice(0, 3900) }));
-  setStatus('Sent to bot ✅');
-  haptic('medium');
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  a.href = url;
+  a.download = `khmer-ocr-${stamp}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  saveHistory(text, 'saved');
+  setStatus('TXT saved ✅');
+  haptic();
+});
+
+sendBtn.addEventListener('click', async () => {
+  const text = result.value.trim();
+  if (!text) return;
+
+  sendBtn.disabled = true;
+  sendBtn.textContent = '⏳ Sending…';
+  setStatus('Sending full text…');
+
+  try {
+    if (tg?.initData) {
+      const response = await fetch('/api/send-text', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Init-Data': tg.initData
+        },
+        body: JSON.stringify({ text })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail || 'Could not send full text');
+      setStatus(`Sent full text ✅ • ${data.characters || text.length} chars`);
+      saveHistory(text, 'sent');
+      haptic('medium');
+      return;
+    }
+
+    if (tg?.sendData && text.length <= 3500) {
+      tg.sendData(JSON.stringify({ type: 'ocr_result', text }));
+      setStatus('Sent to bot ✅');
+      haptic('medium');
+      return;
+    }
+
+    throw new Error('Open the Mini App from Telegram to send long text');
+  } catch (err) {
+    setStatus(err.message);
+  } finally {
+    sendBtn.disabled = false;
+    sendBtn.textContent = '📤 Send to Bot';
+  }
 });
 
 clearBtn.addEventListener('click', () => {
@@ -397,5 +510,10 @@ clearBtn.addEventListener('click', () => {
   setStatus('Ready');
   haptic();
 });
+
+try {
+  const saved = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+  if (storageHint && saved.length) storageHint.textContent = `Saved locally • ${saved.length}/${HISTORY_LIMIT} recent results`;
+} catch (_) {}
 
 loadTelegramImage();
