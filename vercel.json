@@ -1,13 +1,3 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "functions": {
-    "api/**/*.py": {
-      "maxDuration": 30
-    }
-  },
-  "rewrites": [
-    { "source": "/api/telegram-image", "destination": "/api/telegram_image.py" },
-    { "source": "/api/webhook", "destination": "/api/webhook.py" },
-    { "source": "/api/setup", "destination": "/api/setup.py" }
-  ]
+  "$schema": "https://openapi.vercel.sh/vercel.json"
 }
