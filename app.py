@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import json
@@ -15,6 +16,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 SETUP_SECRET = os.getenv("SETUP_SECRET", "").strip()
+GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "").strip()
 
 app = FastAPI(title="Khmer OCR Telegram Bot")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -65,6 +67,58 @@ def validate_init_data(init_data: str) -> bool:
         return hmac.compare_digest(calculated_hash, received_hash)
     except Exception:
         return False
+
+
+def google_vision_ocr(image_bytes: bytes, language: str = "khm") -> str:
+    if not GOOGLE_VISION_API_KEY:
+        raise RuntimeError("GOOGLE_VISION_API_KEY is not configured")
+
+    language_hints = {
+        "khm": ["km"],
+        "khm+eng": ["km", "en"],
+        "eng": ["en"],
+    }.get(language, ["km"])
+
+    payload = {
+        "requests": [
+            {
+                "image": {"content": base64.b64encode(image_bytes).decode("ascii")},
+                "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
+                "imageContext": {"languageHints": language_hints},
+            }
+        ]
+    }
+
+    response = requests.post(
+        "https://vision.googleapis.com/v1/images:annotate",
+        params={"key": GOOGLE_VISION_API_KEY},
+        json=payload,
+        timeout=45,
+    )
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+
+    if not response.ok:
+        detail = data.get("error", {}).get("message") or f"Google Vision HTTP {response.status_code}"
+        raise RuntimeError(detail)
+
+    item = (data.get("responses") or [{}])[0]
+    if item.get("error"):
+        raise RuntimeError(item["error"].get("message", "Google Vision OCR failed"))
+
+    annotation = item.get("fullTextAnnotation") or {}
+    text = str(annotation.get("text") or "").strip()
+    if text:
+        return text
+
+    text_annotations = item.get("textAnnotations") or []
+    if text_annotations:
+        return str(text_annotations[0].get("description") or "").strip()
+
+    return ""
 
 
 def handle_update(update: dict):
@@ -120,7 +174,12 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "bot_configured": bool(BOT_TOKEN), "public_url": bool(PUBLIC_URL)}
+    return {
+        "ok": True,
+        "bot_configured": bool(BOT_TOKEN),
+        "public_url": bool(PUBLIC_URL),
+        "google_vision": bool(GOOGLE_VISION_API_KEY),
+    }
 
 
 @app.get("/api/webhook")
@@ -166,6 +225,29 @@ def setup(x_setup_secret: str | None = Header(default=None)):
     except Exception as exc:
         print("Setup error:", repr(exc))
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/ocr")
+async def ocr(request: Request, language: str = Query(default="khm")):
+    if not GOOGLE_VISION_API_KEY:
+        raise HTTPException(status_code=503, detail="Google Vision OCR is not configured")
+
+    content_type = (request.headers.get("content-type") or "").lower()
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=415, detail="Send an image as the request body")
+
+    image_bytes = await request.body()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Image is empty")
+    if len(image_bytes) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Image is too large")
+
+    try:
+        text = google_vision_ocr(image_bytes, language)
+        return {"ok": True, "provider": "google-vision", "text": text}
+    except Exception as exc:
+        print("Google Vision OCR error:", repr(exc))
+        raise HTTPException(status_code=502, detail=str(exc))
 
 
 @app.get("/api/telegram-image")
