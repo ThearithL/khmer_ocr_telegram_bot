@@ -68,14 +68,98 @@ async function loadTelegramImage() {
   }
 }
 
-async function preprocessForOcr(blob) {
-  updateProgress(0.03, 'Preparing image…');
+async function prepareForCloudOcr(blob) {
+  updateProgress(0.08, 'Preparing image…');
+  const bitmap = await createImageBitmap(blob);
+  const maxSide = 2400;
+  const longSide = Math.max(bitmap.width, bitmap.height);
+  const scale = longSide > maxSide ? maxSide / longSide : 1;
+  const width = Math.max(1, Math.round(bitmap.width * scale));
+  const height = Math.max(1, Math.round(bitmap.height * scale));
 
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, width, height);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(bitmap, 0, 0, width, height);
+  bitmap.close?.();
+
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      b => b ? resolve(b) : reject(new Error('Could not prepare image')),
+      'image/jpeg',
+      0.9
+    );
+  });
+}
+
+function cleanupOcrText(text, lang) {
+  let cleaned = (text || '')
+    .replace(/\r/g, '')
+    .replace(/[\t\u00A0]+/g, ' ')
+    .replace(/ {3,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  if (lang !== 'khm') return cleaned;
+
+  const lines = cleaned.split('\n');
+  const out = [];
+  for (let line of lines) {
+    line = line.trimEnd();
+    if (!line.trim()) {
+      if (out.length && out[out.length - 1] !== '') out.push('');
+      continue;
+    }
+
+    const khmerCount = (line.match(/[\u1780-\u17FF]/g) || []).length;
+    const latinCount = (line.match(/[A-Za-z]/g) || []).length;
+
+    // Remove isolated Latin OCR garbage while keeping punctuation and Khmer text.
+    if (khmerCount > 0 && latinCount > 0) {
+      line = line.replace(/\b[A-Za-z]{1,12}\b/g, '').replace(/ {2,}/g, ' ');
+    }
+
+    // Drop tiny non-Khmer noise-only lines.
+    const meaningful = line.replace(/[\s|+._'"`~\-–—,:;!?()\[\]{}\/\\]/g, '');
+    if (khmerCount === 0 && meaningful.length <= 3) continue;
+
+    out.push(line.trim());
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+async function runGoogleVision(blob) {
+  const cloudBlob = await prepareForCloudOcr(blob);
+  updateProgress(0.25, 'Sending to Google Vision…');
+
+  const response = await fetch(`/api/ocr?language=${encodeURIComponent(language.value)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': cloudBlob.type || 'image/jpeg' },
+    body: cloudBlob
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const err = new Error(data.detail || 'Google Vision OCR failed');
+    err.status = response.status;
+    throw err;
+  }
+
+  updateProgress(0.95, 'Formatting text…');
+  return cleanupOcrText(data.text || '', language.value);
+}
+
+async function preprocessForTesseract(blob) {
   const bitmap = await createImageBitmap(blob);
   const longSide = Math.max(bitmap.width, bitmap.height);
   let scale = 1;
-  if (longSide < 2400) scale = 2400 / longSide;
-  if (longSide * scale > 3200) scale = 3200 / longSide;
+  if (longSide < 2200) scale = 2200 / longSide;
+  if (longSide * scale > 3000) scale = 3000 / longSide;
 
   const width = Math.max(1, Math.round(bitmap.width * scale));
   const height = Math.max(1, Math.round(bitmap.height * scale));
@@ -83,23 +167,15 @@ async function preprocessForOcr(blob) {
   canvas.width = width;
   canvas.height = height;
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(bitmap, 0, 0, width, height);
   bitmap.close?.();
 
-  updateProgress(0.06, 'Improving document contrast…');
   const image = ctx.getImageData(0, 0, width, height);
   const p = image.data;
-  const contrast = 1.34;
-  const midpoint = 132;
-
   for (let i = 0; i < p.length; i += 4) {
     let gray = Math.round(0.299 * p[i] + 0.587 * p[i + 1] + 0.114 * p[i + 2]);
-    gray = Math.round((gray - midpoint) * contrast + midpoint);
+    gray = Math.round((gray - 128) * 1.3 + 128);
     gray = Math.max(0, Math.min(255, gray));
-    if (gray > 232) gray = 255;
-    else if (gray < 38) gray = 0;
     p[i] = p[i + 1] = p[i + 2] = gray;
     p[i + 3] = 255;
   }
@@ -110,97 +186,53 @@ async function preprocessForOcr(blob) {
   });
 }
 
-function khmerScore(text) {
-  const khmer = (text.match(/[\u1780-\u17FF]/g) || []).length;
-  const latin = (text.match(/[A-Za-z]/g) || []).length;
-  const replacement = (text.match(/[�]/g) || []).length;
-  return khmer * 3 - latin - replacement * 6 + Math.min(text.length, 1500) * 0.02;
-}
+async function runTesseractFallback(blob) {
+  if (!window.Tesseract) throw new Error('Fallback OCR engine is unavailable');
+  setStatus('Using fallback OCR…');
+  updateProgress(0.1, 'Loading fallback OCR…');
 
-function cleanupOcrText(text, lang) {
-  let cleaned = (text || '')
-    .replace(/\r/g, '')
-    .replace(/[\t\u00A0]+/g, ' ')
-    .replace(/ {2,}/g, ' ')
-    .replace(/\n{3,}/g, '\n\n');
-
-  const lines = cleaned.split('\n').map(line => line.trim());
-  const filtered = [];
-
-  for (let line of lines) {
-    if (!line) {
-      if (filtered.length && filtered[filtered.length - 1] !== '') filtered.push('');
-      continue;
-    }
-
-    if (lang === 'khm') {
-      // Khmer-only mode: remove obvious Latin OCR garbage such as "blo", "oe", "ole".
-      line = line
-        .replace(/\b[A-Za-z]{1,12}\b/g, '')
-        .replace(/\s+[|+]+\s*$/g, '')
-        .replace(/^[|+]+\s*/g, '')
-        .replace(/ {2,}/g, ' ')
-        .trim();
-
-      const khmerCount = (line.match(/[\u1780-\u17FF]/g) || []).length;
-      const meaningful = line.replace(/[\s|+._'"`~\-–—,:;!?()\[\]{}]/g, '');
-      if (khmerCount === 0 && meaningful.length <= 4) continue;
-    }
-
-    filtered.push(line);
-  }
-
-  return filtered.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-}
-
-scanBtn.addEventListener('click', async () => {
-  if (!selectedBlob || !window.Tesseract) return;
-  scanBtn.disabled = true;
-  scanBtn.textContent = '⏳ Scanning…';
-  progressWrap.classList.remove('hidden');
-  updateProgress(0, 'Loading OCR engine…');
-  setStatus('Reading full document…');
-  result.value = '';
-
+  const prepared = await preprocessForTesseract(blob);
   let worker;
   try {
-    const preparedBlob = await preprocessForOcr(selectedBlob);
-
     worker = await Tesseract.createWorker(language.value, 1, {
       logger: m => {
         if (m.status === 'recognizing text') {
-          const adjusted = 0.1 + (m.progress || 0) * 0.9;
-          updateProgress(adjusted, `Recognizing full page ${Math.round((m.progress || 0) * 100)}%`);
-        } else {
-          progressText.textContent = m.status || 'Working…';
+          updateProgress(0.15 + (m.progress || 0) * 0.8, `Fallback OCR ${Math.round((m.progress || 0) * 100)}%`);
         }
       }
     });
-
     await worker.setParameters({
       preserve_interword_spaces: '1',
       user_defined_dpi: '300',
-      // 3 = automatic page segmentation; better for headings + multiple paragraphs.
       tessedit_pageseg_mode: '3'
     });
+    const { data } = await worker.recognize(prepared);
+    return cleanupOcrText(data.text || '', language.value);
+  } finally {
+    try { await worker?.terminate(); } catch (_) {}
+  }
+}
 
-    const first = await worker.recognize(preparedBlob);
-    let bestText = (first.data?.text || '').trim();
-    let bestScore = khmerScore(bestText);
+scanBtn.addEventListener('click', async () => {
+  if (!selectedBlob) return;
+  scanBtn.disabled = true;
+  scanBtn.textContent = '⏳ Scanning…';
+  progressWrap.classList.remove('hidden');
+  updateProgress(0, 'Starting Google Vision OCR…');
+  setStatus('Google Vision OCR…');
+  result.value = '';
 
-    // Second pass on the original image helps preserve faint or thin Khmer marks.
-    setStatus('Checking second OCR pass…');
-    progressText.textContent = 'Comparing OCR results…';
-    const second = await worker.recognize(selectedBlob);
-    const secondText = (second.data?.text || '').trim();
-    const secondScore = khmerScore(secondText);
-
-    if (secondScore > bestScore) {
-      bestText = secondText;
-      bestScore = secondScore;
+  try {
+    let text = '';
+    try {
+      text = await runGoogleVision(selectedBlob);
+      setStatus('Google Vision done ✅');
+    } catch (cloudErr) {
+      console.warn('Google Vision failed, using fallback:', cloudErr);
+      text = await runTesseractFallback(selectedBlob);
+      setStatus('Fallback OCR done ✅');
     }
 
-    const text = cleanupOcrText(bestText, language.value);
     result.value = text;
     setStatus(text ? 'Done ✅' : 'No text found');
     updateProgress(1, 'Done ✅');
@@ -209,7 +241,6 @@ scanBtn.addEventListener('click', async () => {
     setStatus('OCR error');
     result.value = `❌ OCR failed: ${err.message}`;
   } finally {
-    try { await worker?.terminate(); } catch (_) {}
     scanBtn.disabled = false;
     scanBtn.textContent = '✨ Scan Text';
   }
