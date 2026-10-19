@@ -27,9 +27,16 @@
     <section class="card result-card">
       <div class="result-head"><h2>OCR Result</h2><span id="status">Ready</span></div>
       <textarea id="result" placeholder="អត្ថបទដែលស្គេនបាននឹងបង្ហាញនៅទីនេះ...\nRecognized text will appear here."></textarea>
-      <div class="actions"><button id="copyBtn">📋 Copy</button><button id="sendBtn">📤 Send to Bot</button><button id="clearBtn">🗑 Clear</button></div>
+      <div class="actions">
+        <button id="aiFixBtn">✨ AI Fix OCR</button>
+        <button id="copyBtn">📋 Copy</button>
+        <button id="saveBtn">💾 Save TXT</button>
+        <button id="sendBtn">📤 Send to Bot</button>
+        <button id="clearBtn">🗑 Clear</button>
+      </div>
+      <small id="storageHint">History is saved locally on this device.</small>
     </section>
-    <p class="tip">💡 រូបភាពត្រង់ ច្បាស់ និងមានពន្លឺល្អ នឹងអានអក្សរខ្មែរបានល្អជាង។</p>
+    <p class="tip">💡 រូបភាពត្រង់ ច្បាស់ និងមានពន្លឺល្អ នឹងអានអក្សរខ្មែរបានល្អជាង។ AI Fix កែតែ OCR errors មិនបន្ថែមខ្លឹមសារថ្មី។</p>
   </main>
   <script src="/static/app.js"></script>
 </body>
