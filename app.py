@@ -15,6 +15,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 SETUP_SECRET = os.getenv("SETUP_SECRET", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 
 app = FastAPI(title="Khmer OCR Telegram Bot")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -42,6 +44,30 @@ def send_message(chat_id: int, text: str, reply_markup: dict | None = None):
     return telegram_api("sendMessage", payload)
 
 
+def send_long_message(chat_id: int, text: str):
+    text = text.strip()
+    if not text:
+        return
+    max_len = 3500
+    chunks = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= max_len:
+            chunks.append(remaining)
+            break
+        cut = remaining.rfind("\n", 0, max_len)
+        if cut < max_len // 2:
+            cut = remaining.rfind(" ", 0, max_len)
+        if cut < max_len // 2:
+            cut = max_len
+        chunks.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+
+    for i, chunk in enumerate(chunks, 1):
+        prefix = f"✅ OCR Result ({i}/{len(chunks)}):\n\n" if len(chunks) > 1 else "✅ OCR Result:\n\n"
+        send_message(chat_id, prefix + chunk)
+
+
 def app_keyboard(url: str | None = None):
     app_url = url or PUBLIC_URL
     return {
@@ -51,20 +77,77 @@ def app_keyboard(url: str | None = None):
     }
 
 
-def validate_init_data(init_data: str) -> bool:
+def parse_init_data(init_data: str) -> dict | None:
     if not BOT_TOKEN or not init_data:
-        return False
+        return None
     try:
         data = dict(parse_qsl(init_data, keep_blank_values=True))
         received_hash = data.pop("hash", None)
         if not received_hash:
-            return False
+            return None
         data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
         secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
         calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(calculated_hash, received_hash)
+        if not hmac.compare_digest(calculated_hash, received_hash):
+            return None
+        return data
     except Exception:
-        return False
+        return None
+
+
+def validate_init_data(init_data: str) -> bool:
+    return parse_init_data(init_data) is not None
+
+
+def gemini_fix_ocr(text: str, language: str = "khm") -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+
+    language_note = {
+        "khm": "The document is primarily Khmer.",
+        "khm+eng": "The document may contain Khmer and English.",
+        "eng": "The document is primarily English.",
+    }.get(language, "The document is primarily Khmer.")
+
+    prompt = (
+        "You are an OCR correction assistant. Correct OCR recognition errors only. "
+        "Do not summarize, translate, rewrite, add facts, or invent missing sentences. "
+        "Preserve names, dates, numbers, official abbreviations, paragraph order, and meaning. "
+        "Remove obvious OCR garbage characters and repair likely character/spacing mistakes when context is clear. "
+        "If a word cannot be recovered confidently, keep the original rather than guessing. "
+        f"{language_note} Return only the corrected document text, with no explanation.\n\n"
+        "OCR TEXT:\n" + text
+    )
+
+    response = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        params={"key": GEMINI_API_KEY},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 16384,
+            },
+        },
+        timeout=60,
+    )
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+
+    if not response.ok:
+        detail = data.get("error", {}).get("message") or f"Gemini HTTP {response.status_code}"
+        raise RuntimeError(detail)
+
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise RuntimeError("Gemini returned no corrected text")
+    parts = candidates[0].get("content", {}).get("parts", [])
+    corrected = "".join(str(part.get("text", "")) for part in parts).strip()
+    if not corrected:
+        raise RuntimeError("Gemini returned empty corrected text")
+    return corrected
 
 
 def handle_update(update: dict):
@@ -103,7 +186,7 @@ def handle_update(update: dict):
             data = json.loads(wad.get("data", "{}"))
             ocr_text = str(data.get("text", "")).strip()
             if ocr_text:
-                send_message(chat_id, f"✅ OCR Result:\n\n{ocr_text[:3900]}")
+                send_long_message(chat_id, ocr_text)
             else:
                 send_message(chat_id, "⚠️ No OCR text received.")
         except Exception:
@@ -125,6 +208,8 @@ def health():
         "bot_configured": bool(BOT_TOKEN),
         "public_url": bool(PUBLIC_URL),
         "ocr_mode": "free-browser-tesseract",
+        "ai_fix": bool(GEMINI_API_KEY),
+        "ai_model": GEMINI_MODEL if GEMINI_API_KEY else None,
     }
 
 
@@ -171,6 +256,64 @@ def setup(x_setup_secret: str | None = Header(default=None)):
     except Exception as exc:
         print("Setup error:", repr(exc))
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/ai-fix")
+async def ai_fix(request: Request):
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=503, detail="AI Fix is not configured")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    text = str(body.get("text", "")).strip()
+    language = str(body.get("language", "khm")).strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="OCR text is empty")
+    if len(text) > 60000:
+        raise HTTPException(status_code=413, detail="Text is too long for one AI correction")
+
+    try:
+        corrected = gemini_fix_ocr(text, language)
+        return {"ok": True, "text": corrected, "model": GEMINI_MODEL}
+    except Exception as exc:
+        print("AI Fix error:", repr(exc))
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/api/send-text")
+async def send_text_to_user(
+    request: Request,
+    x_telegram_init_data: str | None = Header(default=None),
+):
+    init_data = parse_init_data(x_telegram_init_data or "")
+    if not init_data:
+        raise HTTPException(status_code=401, detail="Open this Mini App from Telegram")
+
+    try:
+        user = json.loads(init_data.get("user", "{}"))
+        chat_id = int(user.get("id"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not identify Telegram user")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    text = str(body.get("text", "")).strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text is empty")
+    if len(text) > 60000:
+        raise HTTPException(status_code=413, detail="Text is too long")
+
+    try:
+        send_long_message(chat_id, text)
+        return {"ok": True, "characters": len(text)}
+    except Exception as exc:
+        print("Send text error:", repr(exc))
+        raise HTTPException(status_code=502, detail="Could not send text to Telegram")
 
 
 @app.get("/api/telegram-image")
