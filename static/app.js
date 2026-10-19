@@ -27,6 +27,7 @@ const HISTORY_LIMIT = 20;
 
 let selectedBlob = null;
 let previewUrl = null;
+let lastDocumentBlob = null;
 
 function setStatus(text) { status.textContent = text; }
 function haptic(type = 'light') { try { tg?.HapticFeedback?.impactOccurred(type); } catch (_) {} }
@@ -57,6 +58,7 @@ function saveHistory(text, type = 'ocr') {
 
 function showBlob(blob, fromTelegram = false) {
   selectedBlob = blob;
+  lastDocumentBlob = null;
   if (previewUrl) URL.revokeObjectURL(previewUrl);
   previewUrl = URL.createObjectURL(blob);
   preview.src = previewUrl;
@@ -86,8 +88,7 @@ async function loadTelegramImage() {
       const data = await response.json().catch(() => ({}));
       throw new Error(data.detail || 'Cannot load Telegram image');
     }
-    const blob = await response.blob();
-    showBlob(blob, true);
+    showBlob(await response.blob(), true);
   } catch (err) {
     setStatus('Load failed');
     result.value = `❌ ${err.message}`;
@@ -101,6 +102,20 @@ function canvasToBlob(canvas, type = 'image/png', quality) {
       type,
       quality
     );
+  });
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result || '');
+      const comma = dataUrl.indexOf(',');
+      if (comma < 0) return reject(new Error('Could not encode image'));
+      resolve(dataUrl.slice(comma + 1));
+    };
+    reader.onerror = () => reject(new Error('Could not read image'));
+    reader.readAsDataURL(blob);
   });
 }
 
@@ -145,7 +160,6 @@ function detectDocumentCrop(ctx, width, height) {
 
   let [top, bottom] = findBrightSpan(rowScores, 0.52, 0, sampleH - 1);
   let [left, right] = findBrightSpan(colScores, 0.52, 0, sampleW - 1);
-
   const marginX = Math.round(sampleW * 0.015);
   const marginY = Math.round(sampleH * 0.015);
   left = Math.max(0, left - marginX);
@@ -157,17 +171,13 @@ function detectDocumentCrop(ctx, width, height) {
   const sy = Math.round(top / sampleH * height);
   const sw = Math.max(1, Math.round((right - left + 1) / sampleW * width));
   const sh = Math.max(1, Math.round((bottom - top + 1) / sampleH * height));
-
-  if (sw < width * 0.55 || sh < height * 0.55) {
-    return { sx: 0, sy: 0, sw: width, sh: height };
-  }
+  if (sw < width * 0.55 || sh < height * 0.55) return { sx: 0, sy: 0, sw: width, sh: height };
   return { sx, sy, sw, sh };
 }
 
 async function buildOcrVariants(blob) {
   updateProgress(0.03, 'Detecting document…');
   const bitmap = await createImageBitmap(blob);
-
   const src = document.createElement('canvas');
   src.width = bitmap.width;
   src.height = bitmap.height;
@@ -180,11 +190,10 @@ async function buildOcrVariants(blob) {
   const crop = detectDocumentCrop(sctx, src.width, src.height);
   const targetLong = 2800;
   const cropLong = Math.max(crop.sw, crop.sh);
-  let scale = targetLong / cropLong;
-  scale = Math.max(1, Math.min(scale, 2.2));
-
+  const scale = Math.max(1, Math.min(targetLong / cropLong, 2.2));
   const width = Math.max(1, Math.round(crop.sw * scale));
   const height = Math.max(1, Math.round(crop.sh * scale));
+
   const base = document.createElement('canvas');
   base.width = width;
   base.height = height;
@@ -197,7 +206,6 @@ async function buildOcrVariants(blob) {
 
   updateProgress(0.07, 'Improving Khmer text…');
   const raw = bctx.getImageData(0, 0, width, height);
-
   const grayCanvas = document.createElement('canvas');
   grayCanvas.width = width;
   grayCanvas.height = height;
@@ -221,8 +229,8 @@ async function buildOcrVariants(blob) {
   binCanvas.height = height;
   const binCtx = binCanvas.getContext('2d', { willReadFrequently: true });
   const binImg = binCtx.createImageData(width, height);
-
   const integral = new Float64Array((width + 1) * (height + 1));
+
   for (let y = 1; y <= height; y++) {
     let rowSum = 0;
     for (let x = 1; x <= width; x++) {
@@ -243,10 +251,8 @@ async function buildOcrVariants(blob) {
       const B = integral[y1 * (width + 1) + (x2 + 1)];
       const C = integral[(y2 + 1) * (width + 1) + x1];
       const D = integral[(y2 + 1) * (width + 1) + (x2 + 1)];
-      const count = (x2 - x1 + 1) * (y2 - y1 + 1);
-      const mean = (D - B - C + A) / count;
-      const g = grayValues[y * width + x];
-      const v = g < mean - offset ? 0 : 255;
+      const mean = (D - B - C + A) / ((x2 - x1 + 1) * (y2 - y1 + 1));
+      const v = grayValues[y * width + x] < mean - offset ? 0 : 255;
       const i = (y * width + x) * 4;
       binImg.data[i] = binImg.data[i + 1] = binImg.data[i + 2] = v;
       binImg.data[i + 3] = 255;
@@ -259,6 +265,24 @@ async function buildOcrVariants(blob) {
     grayscale: await canvasToBlob(grayCanvas, 'image/png'),
     adaptive: await canvasToBlob(binCanvas, 'image/png')
   };
+}
+
+async function prepareAiImage(blob) {
+  const bitmap = await createImageBitmap(blob);
+  const maxLong = 1800;
+  const longSide = Math.max(bitmap.width, bitmap.height);
+  const scale = Math.min(1, maxLong / longSide);
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close?.();
+  return canvasToBlob(canvas, 'image/jpeg', 0.90);
 }
 
 function khmerScore(text) {
@@ -276,7 +300,6 @@ function cleanupOcrText(text, lang) {
     .replace(/[\t\u00A0]+/g, ' ')
     .replace(/ {2,}/g, ' ')
     .replace(/\n{3,}/g, '\n\n');
-
   const lines = cleaned.split('\n');
   const out = [];
 
@@ -286,42 +309,35 @@ function cleanupOcrText(text, lang) {
       if (out.length && out[out.length - 1] !== '') out.push('');
       continue;
     }
-
     if (lang === 'khm') {
       const khmerCount = (line.match(/[\u1780-\u17FF]/g) || []).length;
       const latinCount = (line.match(/[A-Za-z]/g) || []).length;
-
       if (khmerCount > 0 && latinCount > 0) {
         line = line.replace(/\b[A-Za-z]{1,15}\b/g, '').replace(/ {2,}/g, ' ').trim();
       }
-
       line = line
         .replace(/\s*[|+]+\s*$/g, '')
         .replace(/^[|+]+\s*/g, '')
         .replace(/\s+[._~`]+\s*$/g, '')
         .trim();
-
       const remainingKhmer = (line.match(/[\u1780-\u17FF]/g) || []).length;
       const meaningful = line.replace(/[\s|+._'"`~\-–—,:;!?()\[\]{}\/\\0-9]/g, '');
       if (remainingKhmer === 0 && meaningful.length <= 4) continue;
-
       line = line.replace(/\s{3,}[\u1780-\u17FF]{1,2}\s*$/g, '').trim();
     }
-
     out.push(line);
   }
-
   return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
-async function recognizePass(worker, blob, psm, label, start, span) {
+async function recognizePass(worker, blob, psm, label, progress) {
   await worker.setParameters({
     preserve_interword_spaces: '1',
     user_defined_dpi: '300',
     tessedit_pageseg_mode: String(psm)
   });
   const { data } = await worker.recognize(blob);
-  updateProgress(start + span, label);
+  updateProgress(progress, label);
   return (data?.text || '').trim();
 }
 
@@ -338,7 +354,7 @@ scanBtn.addEventListener('click', async () => {
   let worker;
   try {
     const variants = await buildOcrVariants(selectedBlob);
-
+    lastDocumentBlob = variants.original;
     worker = await Tesseract.createWorker(language.value, 1, {
       logger: m => {
         if (m.status && m.status !== 'recognizing text') progressText.textContent = m.status;
@@ -346,18 +362,12 @@ scanBtn.addEventListener('click', async () => {
     });
 
     const candidates = [];
-
     setStatus('OCR pass 1/3…');
-    updateProgress(0.12, 'Reading cleaned document…');
-    candidates.push(await recognizePass(worker, variants.grayscale, 3, 'Pass 1 complete', 0.12, 0.25));
-
+    candidates.push(await recognizePass(worker, variants.grayscale, 3, 'Pass 1 complete', 0.37));
     setStatus('OCR pass 2/3…');
-    updateProgress(0.40, 'Reading high-contrast document…');
-    candidates.push(await recognizePass(worker, variants.adaptive, 6, 'Pass 2 complete', 0.40, 0.25));
-
+    candidates.push(await recognizePass(worker, variants.adaptive, 6, 'Pass 2 complete', 0.65));
     setStatus('OCR pass 3/3…');
-    updateProgress(0.68, 'Checking original detail…');
-    candidates.push(await recognizePass(worker, variants.original, 3, 'Pass 3 complete', 0.68, 0.22));
+    candidates.push(await recognizePass(worker, variants.original, 3, 'Pass 3 complete', 0.92));
 
     let best = '';
     let bestScore = -Infinity;
@@ -372,7 +382,7 @@ scanBtn.addEventListener('click', async () => {
 
     result.value = best;
     saveHistory(best, 'ocr');
-    setStatus(best ? 'Done ✅ • Free OCR' : 'No text found');
+    setStatus(best ? 'Done ✅ • Tap AI Check to verify with image' : 'No text found');
     updateProgress(1, 'Done ✅');
     haptic('medium');
   } catch (err) {
@@ -392,35 +402,50 @@ aiFixBtn.addEventListener('click', async () => {
     setStatus('Scan text first');
     return;
   }
+  if (!selectedBlob) {
+    setStatus('Original image is required');
+    alert('AI Check needs the original image. Please choose/scan the image again.');
+    return;
+  }
 
   aiFixBtn.disabled = true;
-  aiFixBtn.textContent = '⏳ AI Fixing…';
+  aiFixBtn.textContent = '⏳ Checking image…';
   progressWrap.classList.remove('hidden');
-  updateProgress(0.2, 'AI checking OCR errors…');
-  setStatus('AI Fix OCR…');
+  updateProgress(0.12, 'Preparing original image…');
+  setStatus('AI comparing OCR with original image…');
 
   try {
+    const sourceForAi = lastDocumentBlob || selectedBlob;
+    const aiImage = await prepareAiImage(sourceForAi);
+    const image = await blobToBase64(aiImage);
+    updateProgress(0.35, 'AI reading original image…');
+
     const response = await fetch('/api/ai-fix', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, language: language.value })
+      body: JSON.stringify({
+        text,
+        language: language.value,
+        image,
+        image_mime: 'image/jpeg'
+      })
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.detail || 'AI Fix failed');
+    if (!response.ok) throw new Error(data.detail || `AI Fix failed (${response.status})`);
 
     const corrected = (data.text || '').trim();
     if (!corrected) throw new Error('AI returned empty text');
     result.value = corrected;
-    saveHistory(corrected, 'ai-fix');
-    updateProgress(1, 'AI Fix complete ✅');
-    setStatus('AI Fix done ✅');
+    saveHistory(corrected, data.image_verified ? 'ai-image-verified' : 'ai-fix');
+    updateProgress(1, data.image_verified ? 'Verified with original image ✅' : 'AI Fix complete ✅');
+    setStatus(data.image_verified ? 'AI checked against original image ✅' : 'AI Fix done ✅');
     haptic('medium');
   } catch (err) {
-    setStatus('AI Fix unavailable');
-    alert(`AI Fix: ${err.message}`);
+    setStatus('AI Check failed');
+    alert(`AI Check: ${err.message}`);
   } finally {
     aiFixBtn.disabled = false;
-    aiFixBtn.textContent = '✨ AI Fix OCR';
+    aiFixBtn.textContent = '🖼 AI Check & Fix';
   }
 });
 
@@ -434,16 +459,12 @@ copyBtn.addEventListener('click', async () => {
 
 saveBtn.addEventListener('click', () => {
   const text = result.value.trim();
-  if (!text) {
-    setStatus('No text to save');
-    return;
-  }
+  if (!text) return setStatus('No text to save');
   const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   a.href = url;
-  a.download = `khmer-ocr-${stamp}.txt`;
+  a.download = `khmer-ocr-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -456,11 +477,9 @@ saveBtn.addEventListener('click', () => {
 sendBtn.addEventListener('click', async () => {
   const text = result.value.trim();
   if (!text) return;
-
   sendBtn.disabled = true;
   sendBtn.textContent = '⏳ Sending…';
   setStatus('Sending full text…');
-
   try {
     if (tg?.initData) {
       const response = await fetch('/api/send-text', {
@@ -478,14 +497,12 @@ sendBtn.addEventListener('click', async () => {
       haptic('medium');
       return;
     }
-
     if (tg?.sendData && text.length <= 3500) {
       tg.sendData(JSON.stringify({ type: 'ocr_result', text }));
       setStatus('Sent to bot ✅');
       haptic('medium');
       return;
     }
-
     throw new Error('Open the Mini App from Telegram to send long text');
   } catch (err) {
     setStatus(err.message);
@@ -497,6 +514,7 @@ sendBtn.addEventListener('click', async () => {
 
 clearBtn.addEventListener('click', () => {
   selectedBlob = null;
+  lastDocumentBlob = null;
   input.value = '';
   if (previewUrl) URL.revokeObjectURL(previewUrl);
   previewUrl = null;
@@ -516,4 +534,5 @@ try {
   if (storageHint && saved.length) storageHint.textContent = `Saved locally • ${saved.length}/${HISTORY_LIMIT} recent results`;
 } catch (_) {}
 
+aiFixBtn.textContent = '🖼 AI Check & Fix';
 loadTelegramImage();
