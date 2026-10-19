@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import json
@@ -16,7 +17,7 @@ PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 SETUP_SECRET = os.getenv("SETUP_SECRET", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
 
 app = FastAPI(title="Khmer OCR Telegram Bot")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -99,37 +100,21 @@ def validate_init_data(init_data: str) -> bool:
     return parse_init_data(init_data) is not None
 
 
-def gemini_fix_ocr(text: str, language: str = "khm") -> str:
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY is not configured")
-
-    language_note = {
-        "khm": "The document is primarily Khmer.",
-        "khm+eng": "The document may contain Khmer and English.",
-        "eng": "The document is primarily English.",
-    }.get(language, "The document is primarily Khmer.")
-
-    prompt = (
-        "You are an OCR correction assistant. Correct OCR recognition errors only. "
-        "Do not summarize, translate, rewrite, add facts, or invent missing sentences. "
-        "Preserve names, dates, numbers, official abbreviations, paragraph order, and meaning. "
-        "Remove obvious OCR garbage characters and repair likely character/spacing mistakes when context is clear. "
-        "If a word cannot be recovered confidently, keep the original rather than guessing. "
-        f"{language_note} Return only the corrected document text, with no explanation.\n\n"
-        "OCR TEXT:\n" + text
-    )
-
+def _gemini_request(model: str, parts: list[dict]) -> str:
     response = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-        params={"key": GEMINI_API_KEY},
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY,
+        },
         json={
-            "contents": [{"parts": [{"text": prompt}]}],
+            "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
-                "temperature": 0.1,
+                "temperature": 0.0,
                 "maxOutputTokens": 16384,
             },
         },
-        timeout=60,
+        timeout=75,
     )
     try:
         data = response.json()
@@ -142,12 +127,72 @@ def gemini_fix_ocr(text: str, language: str = "khm") -> str:
 
     candidates = data.get("candidates") or []
     if not candidates:
-        raise RuntimeError("Gemini returned no corrected text")
-    parts = candidates[0].get("content", {}).get("parts", [])
-    corrected = "".join(str(part.get("text", "")) for part in parts).strip()
+        reason = data.get("promptFeedback", {}).get("blockReason")
+        raise RuntimeError(f"Gemini returned no text{': ' + reason if reason else ''}")
+    out_parts = candidates[0].get("content", {}).get("parts", [])
+    corrected = "".join(str(part.get("text", "")) for part in out_parts).strip()
     if not corrected:
         raise RuntimeError("Gemini returned empty corrected text")
     return corrected
+
+
+def gemini_fix_ocr(
+    text: str,
+    language: str = "khm",
+    image_b64: str | None = None,
+    image_mime: str | None = None,
+) -> tuple[str, str, bool]:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+
+    language_note = {
+        "khm": "The document is primarily Khmer.",
+        "khm+eng": "The document may contain Khmer and English.",
+        "eng": "The document is primarily English.",
+    }.get(language, "The document is primarily Khmer.")
+
+    image_used = bool(image_b64 and image_mime)
+    if image_used:
+        prompt = (
+            "You are a high-accuracy document transcription verifier. "
+            "The attached ORIGINAL IMAGE is the source of truth. Compare the OCR draft against the image line by line. "
+            "Return a complete corrected transcription of only the text that is visibly present in the image. "
+            "Correct wrong Khmer characters, vowels/diacritics, missing or extra characters, punctuation, spacing, numbers, and OCR garbage when the image supports the correction. "
+            "Preserve paragraph order, headings, names, dates, numbers, and official abbreviations exactly as visible. "
+            "Do NOT summarize, translate, paraphrase, modernize wording, add facts, or invent text that is not visible. "
+            "If an area is genuinely unreadable, keep the OCR wording when plausible rather than guessing. "
+            f"{language_note} Return ONLY the corrected document text with no explanation or markdown.\n\n"
+            "OCR DRAFT TO VERIFY:\n" + text
+        )
+        parts = [
+            {"inline_data": {"mime_type": image_mime, "data": image_b64}},
+            {"text": prompt},
+        ]
+    else:
+        prompt = (
+            "You are an OCR correction assistant. Correct OCR recognition errors only. "
+            "Do not summarize, translate, rewrite, add facts, or invent missing sentences. "
+            "Preserve names, dates, numbers, official abbreviations, paragraph order, and meaning. "
+            "Remove obvious OCR garbage and repair likely character/spacing errors only when context is clear. "
+            f"{language_note} Return only the corrected document text, with no explanation.\n\n"
+            "OCR TEXT:\n" + text
+        )
+        parts = [{"text": prompt}]
+
+    models = [GEMINI_MODEL]
+    if GEMINI_MODEL != "gemini-2.5-flash-lite":
+        models.append("gemini-2.5-flash-lite")
+
+    last_error = None
+    for model in models:
+        try:
+            return _gemini_request(model, parts), model, image_used
+        except Exception as exc:
+            last_error = exc
+            message = str(exc).lower()
+            if "not found" not in message and "not supported" not in message and "404" not in message:
+                break
+    raise RuntimeError(str(last_error or "Gemini request failed"))
 
 
 def handle_update(update: dict):
@@ -209,6 +254,7 @@ def health():
         "public_url": bool(PUBLIC_URL),
         "ocr_mode": "free-browser-tesseract",
         "ai_fix": bool(GEMINI_API_KEY),
+        "ai_image_verify": bool(GEMINI_API_KEY),
         "ai_model": GEMINI_MODEL if GEMINI_API_KEY else None,
     }
 
@@ -225,7 +271,6 @@ async def webhook(
 ):
     if TELEGRAM_WEBHOOK_SECRET and x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
-
     try:
         update = await request.json()
         handle_update(update)
@@ -261,7 +306,7 @@ def setup(x_setup_secret: str | None = Header(default=None)):
 @app.post("/api/ai-fix")
 async def ai_fix(request: Request):
     if not GEMINI_API_KEY:
-        raise HTTPException(status_code=503, detail="AI Fix is not configured")
+        raise HTTPException(status_code=503, detail="AI Fix is not configured. Add GEMINI_API_KEY in Vercel Production env and redeploy.")
     try:
         body = await request.json()
     except Exception:
@@ -269,14 +314,32 @@ async def ai_fix(request: Request):
 
     text = str(body.get("text", "")).strip()
     language = str(body.get("language", "khm")).strip()
+    image_b64 = str(body.get("image", "")).strip() or None
+    image_mime = str(body.get("image_mime", "")).strip() or None
+
     if not text:
         raise HTTPException(status_code=400, detail="OCR text is empty")
     if len(text) > 60000:
         raise HTTPException(status_code=413, detail="Text is too long for one AI correction")
 
+    if image_b64:
+        if image_mime not in {"image/jpeg", "image/png", "image/webp"}:
+            raise HTTPException(status_code=400, detail="Unsupported image type for AI verification")
+        try:
+            decoded = base64.b64decode(image_b64, validate=True)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid image data")
+        if len(decoded) > 7 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Image is too large for AI verification")
+
     try:
-        corrected = gemini_fix_ocr(text, language)
-        return {"ok": True, "text": corrected, "model": GEMINI_MODEL}
+        corrected, model, image_used = gemini_fix_ocr(text, language, image_b64, image_mime)
+        return {
+            "ok": True,
+            "text": corrected,
+            "model": model,
+            "image_verified": image_used,
+        }
     except Exception as exc:
         print("AI Fix error:", repr(exc))
         raise HTTPException(status_code=502, detail=str(exc))
