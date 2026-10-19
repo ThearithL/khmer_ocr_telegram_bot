@@ -73,16 +73,12 @@ async function preprocessForOcr(blob) {
 
   const bitmap = await createImageBitmap(blob);
   const longSide = Math.max(bitmap.width, bitmap.height);
-
-  // OCR works much better when small Khmer glyphs are enlarged.
-  // Target about 2400 px on the longest edge, capped to avoid memory problems.
   let scale = 1;
-  if (longSide < 2200) scale = 2200 / longSide;
-  if (longSide * scale > 3000) scale = 3000 / longSide;
+  if (longSide < 2400) scale = 2400 / longSide;
+  if (longSide * scale > 3200) scale = 3200 / longSide;
 
   const width = Math.max(1, Math.round(bitmap.width * scale));
   const height = Math.max(1, Math.round(bitmap.height * scale));
-
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
@@ -93,33 +89,68 @@ async function preprocessForOcr(blob) {
   bitmap.close?.();
 
   updateProgress(0.06, 'Improving document contrast…');
-
   const image = ctx.getImageData(0, 0, width, height);
   const p = image.data;
+  const contrast = 1.34;
+  const midpoint = 132;
 
-  // Grayscale + gentle contrast boost + near-white background cleanup.
-  // This keeps thin Khmer vowels/diacritics better than hard thresholding.
-  const contrast = 1.42;
-  const midpoint = 128;
   for (let i = 0; i < p.length; i += 4) {
     let gray = Math.round(0.299 * p[i] + 0.587 * p[i + 1] + 0.114 * p[i + 2]);
     gray = Math.round((gray - midpoint) * contrast + midpoint);
     gray = Math.max(0, Math.min(255, gray));
-
-    if (gray > 225) gray = 255;
-    else if (gray < 45) gray = 0;
-
+    if (gray > 232) gray = 255;
+    else if (gray < 38) gray = 0;
     p[i] = p[i + 1] = p[i + 2] = gray;
     p[i + 3] = 255;
   }
   ctx.putImageData(image, 0, 0);
 
   return new Promise((resolve, reject) => {
-    canvas.toBlob(
-      b => b ? resolve(b) : reject(new Error('Could not preprocess image')),
-      'image/png'
-    );
+    canvas.toBlob(b => b ? resolve(b) : reject(new Error('Could not preprocess image')), 'image/png');
   });
+}
+
+function khmerScore(text) {
+  const khmer = (text.match(/[\u1780-\u17FF]/g) || []).length;
+  const latin = (text.match(/[A-Za-z]/g) || []).length;
+  const replacement = (text.match(/[�]/g) || []).length;
+  return khmer * 3 - latin - replacement * 6 + Math.min(text.length, 1500) * 0.02;
+}
+
+function cleanupOcrText(text, lang) {
+  let cleaned = (text || '')
+    .replace(/\r/g, '')
+    .replace(/[\t\u00A0]+/g, ' ')
+    .replace(/ {2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n');
+
+  const lines = cleaned.split('\n').map(line => line.trim());
+  const filtered = [];
+
+  for (let line of lines) {
+    if (!line) {
+      if (filtered.length && filtered[filtered.length - 1] !== '') filtered.push('');
+      continue;
+    }
+
+    if (lang === 'khm') {
+      // Khmer-only mode: remove obvious Latin OCR garbage such as "blo", "oe", "ole".
+      line = line
+        .replace(/\b[A-Za-z]{1,12}\b/g, '')
+        .replace(/\s+[|+]+\s*$/g, '')
+        .replace(/^[|+]+\s*/g, '')
+        .replace(/ {2,}/g, ' ')
+        .trim();
+
+      const khmerCount = (line.match(/[\u1780-\u17FF]/g) || []).length;
+      const meaningful = line.replace(/[\s|+._'"`~\-–—,:;!?()\[\]{}]/g, '');
+      if (khmerCount === 0 && meaningful.length <= 4) continue;
+    }
+
+    filtered.push(line);
+  }
+
+  return filtered.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 scanBtn.addEventListener('click', async () => {
@@ -138,7 +169,6 @@ scanBtn.addEventListener('click', async () => {
     worker = await Tesseract.createWorker(language.value, 1, {
       logger: m => {
         if (m.status === 'recognizing text') {
-          // Leave the first 10% of the bar for preprocessing/loading.
           const adjusted = 0.1 + (m.progress || 0) * 0.9;
           updateProgress(adjusted, `Recognizing full page ${Math.round((m.progress || 0) * 100)}%`);
         } else {
@@ -150,22 +180,27 @@ scanBtn.addEventListener('click', async () => {
     await worker.setParameters({
       preserve_interword_spaces: '1',
       user_defined_dpi: '300',
-      // 6 = assume one uniform block of text; works well for full-page documents.
-      tessedit_pageseg_mode: '6'
+      // 3 = automatic page segmentation; better for headings + multiple paragraphs.
+      tessedit_pageseg_mode: '3'
     });
 
-    const { data } = await worker.recognize(preparedBlob);
-    let text = (data.text || '').trim();
+    const first = await worker.recognize(preparedBlob);
+    let bestText = (first.data?.text || '').trim();
+    let bestScore = khmerScore(bestText);
 
-    // If preprocessing produced unexpectedly little text, retry the original image.
-    if (text.length < 120) {
-      setStatus('Retrying original image…');
-      progressText.textContent = 'Retrying OCR on original image…';
-      const retry = await worker.recognize(selectedBlob);
-      const retryText = (retry.data?.text || '').trim();
-      if (retryText.length > text.length) text = retryText;
+    // Second pass on the original image helps preserve faint or thin Khmer marks.
+    setStatus('Checking second OCR pass…');
+    progressText.textContent = 'Comparing OCR results…';
+    const second = await worker.recognize(selectedBlob);
+    const secondText = (second.data?.text || '').trim();
+    const secondScore = khmerScore(secondText);
+
+    if (secondScore > bestScore) {
+      bestText = secondText;
+      bestScore = secondScore;
     }
 
+    const text = cleanupOcrText(bestText, language.value);
     result.value = text;
     setStatus(text ? 'Done ✅' : 'No text found');
     updateProgress(1, 'Done ✅');
